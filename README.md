@@ -12,7 +12,7 @@ predictors:
 
 Spearman ρ between predicted and measured DMS scores on the
 [Gersing 2022](https://doi.org/10.1101/2022.10.10.511562) HXK4_HUMAN
-dataset (8,570 single-residue mutants), MSA depth 5,000.
+dataset (8,570 single-residue mutants).
 
 ![HXK4_HUMAN benchmark](figures/hxk4_spearman.png)
 
