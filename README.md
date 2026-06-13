@@ -1,6 +1,6 @@
 # pg2_models
 
-`evedesign` model wrappers for two MSA-based protein mutation effect
+Drop-in `evedesign` model wrappers for two MSA-based protein mutation effect
 predictors:
 
 - **SIFT** — Sorting Intolerant From Tolerated
@@ -24,7 +24,8 @@ msa = Sequences(
 )
 system = System([Protein(id="toy", rep=target, first_index=1, sequences=msa)])
 
-# build = run GEMME inside the docker image and load the score matrix
+# build = run GEMME from the local source tree and load the score matrix.
+# `gemme_path` / `jet_path` default to the GEMME_PATH / JET_PATH env vars,
 model = GEMME(n_iter=1, n_seqs=2000).build(system)
 
 # full L x 20 single-mutation effect matrix (higher = more native-like)
@@ -65,3 +66,11 @@ model = SIFT().build(system)               # invokes info_on_seqs
 scan  = model.single_mutation_scan(system.rep_to_instance(), entity=0)
 print(scan.iloc[:3].round(2))
 ```
+
+## Score conventions
+
+Both wrappers follow the _higher = more native-like_ convention, so
+`single_mutation_scan` values can be correlated directly with DMS activity
+scores via `scipy.stats.spearmanr` without sign flipping. The diagonal
+(WT residue) is exactly `0.0`; positions a model could not score are
+returned as all-NaN rows.

@@ -10,11 +10,23 @@ each homologous sequence is from the query in conservation-weighted Hamming
 distance. The output is a 20xL matrix of log-odds-like scores that is
 normalised so the wild-type residue at each position has score 0.
 
-The reference implementation is a small Python 2.7 / R / Java stack shipped
-in the official Docker image at https://hub.docker.com/r/elodielaine/gemme.
-This wrapper drives that image as a subprocess; no Python bindings are
-required. Apple Silicon users need ``--platform linux/amd64`` because the
-image is published as x86_64-only; the wrapper sets that automatically.
+The reference implementation is a small Python 2.7 / R / Java stack
+distributed as source from the LCQB lab
+(https://www.lcqb.upmc.fr/GEMME/download.html). This wrapper drives the
+local source tree directly via ``subprocess`` -- no Docker plumbing in the
+wrapper itself -- pointed at by ``GEMME_PATH`` (the GEMME source root, which
+ships ``gemme.py``) and ``JET_PATH`` (the JET2 source root used by GEMME
+internally for conservation analysis). Both env vars match the upstream
+convention.
+
+For users on platforms where installing the GEMME stack natively is
+inconvenient (notably macOS with no system Python 2.7), the recommended
+recipe is to run *the calling code* (this wrapper, plus tests/examples)
+inside the upstream container image ``elodielaine/gemme:gemme``, which
+already has GEMME, JET2, R, and Java pre-installed at the canonical paths
+``/opt/GEMME`` and ``/opt/JET2``. The repo ships a thin convenience script
+``scripts/gemme-in-docker.sh`` that mounts the repo into that container and
+forwards an arbitrary command (e.g. ``pytest``, ``jupyter nbconvert``).
 
 Interfaces implemented:
 
@@ -24,6 +36,8 @@ Interfaces implemented:
 * `ConditionalMutationScorer` — per-position log-odds slice of the matrix.
 * `Generator`                 — Gibbs sampling via the standard
                                 ``GibbsSampler`` composition.
+* `Transformer`               — stashes per-residue normalised log-odds (vs
+                                the entity rep) as ``entity_instance.embedding``.
 
 We deliberately do **not** implement `Scorer`: GEMME outputs are
 per-substitution deltas, not joint sequence likelihoods. Summing the
@@ -32,6 +46,7 @@ single-mutant scores, which conveys no extra information.
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -50,6 +65,7 @@ from evedesign.model import (
     ConditionalMutationScorer,
     Generator,
     MutationScorer,
+    Transformer,
 )
 from evedesign.samplers.gibbs import (
     GibbsSampler,
@@ -78,18 +94,47 @@ _GEMME_AA_LOWER: list[str] = [aa.lower() for aa in VALID_AA_SORTED]
 _GEMME_SCORE_FLOOR: float = -20.0
 
 
-def _detect_docker_command(explicit: str | None) -> str | None:
-    """Find a docker-compatible CLI on $PATH. Honours an explicit override."""
-    if explicit is not None:
-        return explicit if shutil.which(explicit) else None
-    for candidate in ("docker", "podman", "udocker"):
-        if shutil.which(candidate) is not None:
-            return candidate
-    return None
+# Default install paths used by the upstream Docker image and the canonical
+# tarball layout from the LCQB download page. Either env var or constructor
+# argument can override these.
+_DEFAULT_GEMME_PATH = "/opt/GEMME"
+_DEFAULT_JET_PATH = "/opt/JET2"
 
 
-# Tolerant import-time check; the real check happens at construction.
-IMPORT_AVAILABLE = _detect_docker_command(None) is not None
+def _detect_gemme_install(
+    explicit_gemme: str | os.PathLike | None,
+    explicit_jet: str | os.PathLike | None,
+) -> tuple[Path | None, Path | None]:
+    """
+    Resolve GEMME and JET2 source roots from explicit args, env vars, or
+    the canonical defaults. Returns (None, None) for components missing
+    on this machine.
+    """
+    gemme = explicit_gemme or os.environ.get("GEMME_PATH") or _DEFAULT_GEMME_PATH
+    jet = explicit_jet or os.environ.get("JET_PATH") or _DEFAULT_JET_PATH
+    gemme_path = Path(gemme).resolve() if gemme else None
+    jet_path = Path(jet).resolve() if jet else None
+    if gemme_path is not None and not (gemme_path / "gemme.py").is_file():
+        gemme_path = None
+    if jet_path is not None and not jet_path.is_dir():
+        jet_path = None
+    return gemme_path, jet_path
+
+
+# Importable iff a usable GEMME tree, a JET2 tree, and a `python2.7` binary
+# are all reachable. Note: we still allow construction when this is False --
+# the wrapper raises a precise error at that point -- so unit tests that
+# only inspect class metadata can still import the module.
+def _import_check() -> bool:
+    gemme_path, jet_path = _detect_gemme_install(None, None)
+    return (
+        gemme_path is not None
+        and jet_path is not None
+        and shutil.which("python2.7") is not None
+    )
+
+
+IMPORT_AVAILABLE = _import_check()
 
 
 class GEMME(
@@ -97,30 +142,32 @@ class GEMME(
     MutationScorer,
     ConditionalMutationScorer,
     Generator,
+    Transformer,
 ):
     """
-    Wrapper around the GEMME 2019 Docker image (`elodielaine/gemme:gemme`).
+    Wrapper around the GEMME 2019 reference implementation, run from a local
+    source checkout (https://www.lcqb.upmc.fr/GEMME/download.html).
 
     Parameters
     ----------
-    docker_image
-        Image tag to run. Defaults to the upstream ``elodielaine/gemme:gemme``.
-    docker_command
-        Container CLI to invoke. Defaults to autodetect (``docker``, then
-        ``podman``, then ``udocker``).
-    platform
-        Container platform string. Defaults to ``"linux/amd64"`` (the upstream
-        image is single-arch x86_64); pass ``None`` to omit the flag.
     gemme_path
-        Path inside the container at which GEMME is installed. Defaults to the
-        ``/opt/GEMME`` location used by the upstream image.
+        Path to the GEMME source root that contains ``gemme.py``. Defaults
+        to the ``GEMME_PATH`` env var, falling back to ``/opt/GEMME`` (the
+        canonical install location used by the upstream Docker image).
+    jet_path
+        Path to the JET2 source root used internally by GEMME for
+        conservation analysis. Defaults to ``JET_PATH``, falling back to
+        ``/opt/JET2``.
+    python_command
+        Python interpreter to invoke. GEMME's reference implementation is
+        Python 2.7 only, so the default is ``"python2.7"``.
     n_iter
         Number of JET iterations used to compute conservation levels. The
-        paper recommends 1 (default) for production; bump to 7-10 to mitigate
-        JET's Gibbs-sampling stochasticity at higher cost.
+        paper recommends 1 (default) for production; bump to 7-10 to
+        mitigate JET's Gibbs-sampling stochasticity at higher cost.
     n_seqs
         Maximum number of MSA sequences passed to JET. Larger MSAs are
-        subsampled. The Docker default of 20000 matches the webserver.
+        subsampled. Default of 20000 matches the upstream webserver.
     model_variant
         Which GEMME output table to load: ``"combi"`` (default; combined
         independent + epistatic, recommended for most tasks), ``"epi"``
@@ -156,10 +203,9 @@ class GEMME(
 
     def __init__(
         self,
-        docker_image: str = "elodielaine/gemme:gemme",
-        docker_command: str | None = None,
-        platform: str | None = "linux/amd64",
-        gemme_path: str = "/opt/GEMME",
+        gemme_path: str | os.PathLike | None = None,
+        jet_path: str | os.PathLike | None = None,
+        python_command: str = "python2.7",
         n_iter: int = 1,
         n_seqs: int = 20000,
         model_variant: str = "combi",
@@ -170,23 +216,39 @@ class GEMME(
         scan_order: ScanOrder = "random",
         temperature_schedule: TemperatureSchedule | None = None,
     ):
-        self.docker_command = _detect_docker_command(docker_command)
-        if self.docker_command is None:
-            raise ValueError(
-                "Could not find a container runtime on PATH. Install Docker "
-                "(or podman / udocker) and re-try, or pass "
-                "docker_command='/path/to/docker'."
-            )
-
         if model_variant not in self._VARIANT_TO_FILE:
             raise ValueError(
                 f"Unknown model_variant {model_variant!r}. "
                 f"Expected one of {sorted(self._VARIANT_TO_FILE)}."
             )
 
-        self.docker_image = docker_image
-        self.platform = platform
-        self.gemme_path = gemme_path
+        resolved_gemme, resolved_jet = _detect_gemme_install(gemme_path, jet_path)
+        if resolved_gemme is None:
+            raise ValueError(
+                "Could not locate a GEMME source tree containing gemme.py. "
+                "Set the GEMME_PATH env var (or pass gemme_path=...) to the "
+                "directory you got from "
+                "https://www.lcqb.upmc.fr/GEMME/download.html, or run inside "
+                "the upstream Docker image elodielaine/gemme:gemme via "
+                "scripts/gemme-in-docker.sh."
+            )
+        if resolved_jet is None:
+            raise ValueError(
+                "Could not locate a JET2 source tree. Set the JET_PATH env "
+                "var (or pass jet_path=...) to the directory bundled with "
+                "GEMME, or run inside the upstream Docker image."
+            )
+        if shutil.which(python_command) is None:
+            raise ValueError(
+                f"GEMME requires {python_command!r} on $PATH (the reference "
+                "implementation is Python 2.7 only). Either install it "
+                "natively or run inside the upstream Docker image via "
+                "scripts/gemme-in-docker.sh."
+            )
+
+        self.gemme_path = resolved_gemme
+        self.jet_path = resolved_jet
+        self.python_command = python_command
         self.n_iter = int(n_iter)
         self.n_seqs = int(n_seqs)
         self.model_variant = model_variant
@@ -261,39 +323,6 @@ class GEMME(
                 f.write(f">{safe_id}\n{seq.seq}\n")
         return query_name
 
-    def _docker_run(
-        self,
-        workdir: Path,
-        inner_cmd: str,
-    ) -> subprocess.CompletedProcess:
-        """
-        Invoke ``docker run`` with the GEMME image, bind-mounting `workdir`
-        at the same path inside the container so the wrapper can read the
-        output files back from the host filesystem.
-        """
-        cmd = [self.docker_command, "run", "--rm"]
-        if self.platform is not None:
-            cmd += ["--platform", self.platform]
-        # Mount workdir into the container at the same path; cd into it.
-        cmd += [
-            "-v", f"{workdir}:{workdir}",
-            "-w", str(workdir),
-            self.docker_image,
-            "sh", "-c",
-            f"GEMME_PATH={self.gemme_path} {inner_cmd}",
-        ]
-        logger.debug("GEMME docker cmd: {}", " ".join(cmd))
-        try:
-            return subprocess.run(
-                cmd, check=True, capture_output=True, text=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"GEMME docker invocation failed (exit {exc.returncode}):\n"
-                f"stdout (tail):\n{exc.stdout[-2000:]}\n"
-                f"stderr (tail):\n{exc.stderr[-2000:]}"
-            ) from exc
-
     def _run_gemme(
         self,
         workdir: Path,
@@ -301,17 +330,43 @@ class GEMME(
         query_name: str,
         mutations_filename: str | None = None,
     ) -> None:
-        """Run a single ``python2.7 gemme.py ...`` invocation."""
-        inner = (
-            f"python2.7 {self.gemme_path}/gemme.py {alignment_filename} "
-            f"-r input -f {alignment_filename} "
-            f"-n {self.n_iter} -N {self.n_seqs}"
-        )
+        """
+        Run a single ``python2.7 gemme.py ...`` invocation against the local
+        GEMME source tree. ``GEMME_PATH`` and ``JET_PATH`` are exported into
+        the child environment because GEMME's R/Java callouts read them.
+        """
+        cmd = [
+            self.python_command,
+            str(self.gemme_path / "gemme.py"),
+            alignment_filename,
+            "-r", "input",
+            "-f", alignment_filename,
+            "-n", str(self.n_iter),
+            "-N", str(self.n_seqs),
+        ]
         if mutations_filename is not None:
-            inner += f" -m {mutations_filename}"
+            cmd += ["-m", mutations_filename]
 
-        # GEMME prints to stdout but emits files; we just rely on the file outputs.
-        self._docker_run(workdir, inner)
+        env = os.environ.copy()
+        env["GEMME_PATH"] = f"{self.gemme_path}/"
+        env["JET_PATH"] = f"{self.jet_path}/"
+
+        logger.debug("GEMME cmd: {} (cwd={})", " ".join(cmd), workdir)
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=str(workdir),
+                env=env,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"GEMME invocation failed (exit {exc.returncode}):\n"
+                f"stdout (tail):\n{exc.stdout[-2000:]}\n"
+                f"stderr (tail):\n{exc.stderr[-2000:]}"
+            ) from exc
 
         out_file = workdir / f"{query_name}_{self._VARIANT_TO_FILE[self.model_variant]}"
         if not out_file.is_file():
@@ -417,8 +472,8 @@ class GEMME(
         self._query_name = self._write_aligned_fasta(system, alignment_path)
 
         logger.info(
-            "Running GEMME (variant={}, n_iter={}, n_seqs={}, image={}) ...",
-            self.model_variant, self.n_iter, self.n_seqs, self.docker_image,
+            "Running GEMME (variant={}, n_iter={}, n_seqs={}, gemme_path={}) ...",
+            self.model_variant, self.n_iter, self.n_seqs, self.gemme_path,
         )
         self._run_gemme(
             workdir=self._workdir_path,
@@ -730,6 +785,67 @@ class GEMME(
             index, names=["instance", "entity", "pos"]
         )
         return df
+
+    # ----------------------------------------------------- Transformer API
+
+    def transform(
+        self,
+        instances: Sequence[SystemInstance],
+        entity: int | None = None,
+        status_callback: StatusCallback | None = None,  # noqa: ARG002
+    ) -> list[SystemInstance]:
+        """
+        Decompose each instance into per-residue GEMME log-odds (relative
+        to the entity rep) and stash the result as
+        ``entity_instance.embedding``.
+
+        ``embedding[i]`` is the normalised GEMME score for substituting
+        the entity rep's residue at position i with the *instance*'s
+        residue at the same position. By GEMME's normalisation, this is 0
+        when the instance matches the rep at that position and otherwise
+        equals the predicted ΔS for that single substitution. The vector
+        sums to the same "sum-of-singles ΔS" that ``generate()`` reports as
+        ``inst.score`` for designed sequences.
+
+        Returns shallow copies of each instance with ``embedding`` and
+        ``score`` filled in; the input list is left unmodified per the
+        Transformer contract.
+        """
+        self.ready_or_raise()
+        self._validate_instances(instances)
+
+        entity = 0 if entity is None else entity
+        if entity != 0:
+            raise ValueError("Model can only handle one single entity")
+
+        target = self.system[0]
+        rep_chars = np.asarray(target.rep, dtype="U1")
+        aa_to_col = {aa: i for i, aa in enumerate(VALID_AA_SORTED)}
+        L = len(rep_chars)
+
+        out: list[SystemInstance] = []
+        for instance in instances:
+            inst_chars = np.asarray(instance[entity].rep, dtype="U1")
+            per_residue = np.full(L, np.nan)
+            for i in range(L):
+                ref_aa = str(rep_chars[i])
+                inst_aa = str(inst_chars[i])
+                if inst_aa == ref_aa:
+                    per_residue[i] = 0.0
+                    continue
+                col = aa_to_col.get(inst_aa)
+                if col is None:
+                    continue  # leaves NaN
+                val = self.encoding[i, col]
+                # NaN cells (positions GEMME couldn't score) propagate
+                # through to the embedding by design.
+                per_residue[i] = float(val)
+
+            inst_copy = instance.copy()
+            inst_copy[entity].embedding = per_residue
+            inst_copy.score = float(np.nansum(per_residue))
+            out.append(inst_copy)
+        return out
 
     # ------------------------------------------------------- Generator API
 

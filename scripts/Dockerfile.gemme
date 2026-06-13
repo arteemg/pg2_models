@@ -1,0 +1,52 @@
+# Run-environment for the GEMME wrapper that has both:
+#   * Python 3.12 (for evedesign + our wrapper code)
+#   * Python 2.7 + R + Java + the GEMME / JET2 source trees (for GEMME itself).
+#
+# We start *from* the upstream `elodielaine/gemme:gemme` image (so we
+# inherit GEMME at /opt/GEMME, JET2 at /opt/JET2, Python 2.7, R and Java
+# already configured) and bolt on a Python 3.12 runtime via micromamba.
+ARG GEMME_IMAGE=elodielaine/gemme:gemme
+
+FROM ${GEMME_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    GEMME_PATH=/opt/GEMME/ \
+    JET_PATH=/opt/JET2/ \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_INPUT=1
+
+# bzip2 is needed to unpack the micromamba tarball; ca-certificates is
+# already present on the upstream image but we make sure the trust store is
+# usable for HTTPS pulls from the conda CDN.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bzip2 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Drop micromamba into /usr/local/bin and install Python 3.12 + the
+# evedesign runtime deps the GEMME wrapper transitively pulls in (via
+# evedesign.system / evedesign.structure / evedesign.samplers.gibbs).
+# torch comes from PyTorch's CPU-only channel via pip to avoid CUDA bloat.
+ENV MAMBA_ROOT_PREFIX=/opt/conda
+RUN curl -L https://micro.mamba.pm/api/micromamba/linux-64/latest \
+        -o /tmp/mm.tar.bz2 \
+    && mkdir -p /opt/micromamba \
+    && tar -xvjf /tmp/mm.tar.bz2 -C /opt/micromamba bin/micromamba \
+    && mv /opt/micromamba/bin/micromamba /usr/local/bin/micromamba \
+    && rm -rf /tmp/mm.tar.bz2 /opt/micromamba \
+    && micromamba install -y -n base -c conda-forge \
+        python=3.12 pip \
+        numpy pandas scipy loguru biotite biopython \
+        scikit-learn numba matplotlib \
+    && /opt/conda/bin/pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu torch \
+    && /opt/conda/bin/pip install --no-cache-dir \
+        dnachisel pytest ipykernel nbconvert \
+    && micromamba clean -a -y \
+    && rm -rf /root/.cache/pip
+
+# Make the conda Python the default `python` / `python3` while preserving
+# the system /usr/bin/python2.7 that GEMME itself drives.
+ENV PATH=/opt/conda/bin:${PATH}
+
+WORKDIR /work

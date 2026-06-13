@@ -8,15 +8,22 @@ standalone SIFT 6.x release (http://sift-dna.org), which takes an aligned
 FASTA and emits a position-specific scoring matrix of normalized AA
 probabilities.
 
-The wrapper exposes the ``MutationScorer`` and ``ConditionalMutationScorer``
-interfaces only:
+The wrapper exposes ``Scorer``, ``MutationScorer``, ``ConditionalMutationScorer``,
+``Generator``, and ``Transformer``:
 
-* SIFT assumes independence across positions (the joint sequence likelihood
-  is just the product of column-normalized probabilities), so we deliberately
-  do not implement ``Scorer`` to avoid implying a meaningful whole-sequence
-  energy.
-* SIFT is a predictor, not a generative model -> no ``Generator``.
-* The PSSM could be exposed as an embedding but is not in scope here.
+* ``score`` returns the sum of column-normalized log-probabilities under the
+  PSSM, ``sum_i log p_i(x_i)``. Under SIFT's per-position independence
+  assumption this *is* the joint log-likelihood; we surface it via the
+  ``Scorer`` interface but it should be interpreted as a tractable
+  product-of-marginals lower bound rather than a true co-evolutionary score.
+* SIFT is not natively generative, but its per-column conditional
+  probabilities make a perfectly valid Gibbs proposal distribution. We use
+  ``GibbsSampler`` on top of ``score_conditional`` to expose ``generate``,
+  identical to the pattern used for GEMME.
+* ``transform`` decomposes the joint score by residue, stashing the
+  per-position log-probability vector ``log p_i(x_i)`` as the entity's
+  ``embedding``. This lets callers visualise *which* residues drive an
+  instance's overall conservation score.
 
 Note: the companion ``SIFTINDEL`` tool is **not** wrapped. It is a
 human-specific exome indel pipeline (requires Ensembl coding tables and the
@@ -42,10 +49,26 @@ from evedesign.constants import VALID_AA_SORTED
 from evedesign.model import (
     BaseModel,
     ConditionalMutationScorer,
+    Generator,
     MutationScorer,
+    Scorer,
+    Transformer,
 )
-from evedesign.system import Mutant, System, SystemInstance
-from evedesign.types import StatusCallback
+from evedesign.samplers.gibbs import (
+    GibbsSampler,
+    InitStrategy,
+    ScanOrder,
+    TemperatureSchedule,
+)
+from evedesign.system import (
+    EntityInstance,
+    Mutant,
+    Mutation,
+    System,
+    SystemInstance,
+)
+from evedesign.types import EntityPosList, StatusCallback
+from evedesign.utils import ensure_sequence
 
 
 # SIFT columns of the FLOAT_OUTPUT PSSM matrix emitted by blimps `output_matrix_s`:
@@ -91,7 +114,8 @@ def _which_info_on_seqs(sift_home: Path | None) -> Path | None:
 IMPORT_AVAILABLE = _which_info_on_seqs(_detect_sift_home(None)) is not None
 
 
-class SIFT(BaseModel, MutationScorer, ConditionalMutationScorer):
+class SIFT(BaseModel, Scorer, MutationScorer, ConditionalMutationScorer,
+           Generator, Transformer):
     """
     Wrapper around the standalone SIFT ``info_on_seqs`` binary.
 
@@ -136,6 +160,11 @@ class SIFT(BaseModel, MutationScorer, ConditionalMutationScorer):
         sift_home: str | PathLike | None = None,
         blimps_dir: str | PathLike | None = None,
         keep_pssm_after_build: bool = True,
+        # GibbsSampler hyperparameters (used by generate()).
+        num_sweeps: int = 1000,
+        init_strategy: InitStrategy = "system",
+        scan_order: ScanOrder = "random",
+        temperature_schedule: TemperatureSchedule | None = None,
     ):
         self.sift_home = _detect_sift_home(sift_home)
         self.binary_path = _which_info_on_seqs(self.sift_home)
@@ -164,6 +193,12 @@ class SIFT(BaseModel, MutationScorer, ConditionalMutationScorer):
             )
 
         self.keep_pssm_after_build = keep_pssm_after_build
+
+        # GibbsSampler config used by generate()
+        self.num_sweeps = num_sweeps
+        self.init_strategy = init_strategy
+        self.scan_order = scan_order
+        self.temperature_schedule = temperature_schedule
 
         self._system: System | None = None
         self._tmpdir: tempfile.TemporaryDirectory | None = None
@@ -402,6 +437,105 @@ class SIFT(BaseModel, MutationScorer, ConditionalMutationScorer):
 
         return self
 
+    # --- Scorer API ---------------------------------------------------------
+
+    def score(
+        self,
+        instances: Sequence[SystemInstance],
+        status_callback: StatusCallback | None = None,  # noqa: ARG002
+    ) -> np.ndarray:
+        """
+        Return a sum-of-marginals log-likelihood per instance,
+        ``S(x) = sum_i log p_i(x_i)``, where ``p_i`` is SIFT's column-
+        normalized PSSM at position ``i`` (floored at ``_SIFT_PROB_FLOOR`` to
+        keep the score finite for residues SIFT clipped to 0).
+
+        Note: SIFT explicitly assumes per-position independence, so this is
+        equivalent to the model's joint log-likelihood. Scores are raw logits
+        comparable across instances within the same call. NOT-SCORED
+        positions (rows that are all NaN in ``self.encoding``) contribute
+        ``np.nan`` to the total — meaning at least one such position
+        anywhere in the instance will produce ``nan`` for the whole
+        instance, by design.
+        """
+        self.ready_or_raise()
+        self._validate_instances(instances)
+
+        log_pssm = self._pssm_to_log(self.encoding)
+        target = self.system[0]
+        aa_to_col = {aa: i for i, aa in enumerate(VALID_AA_SORTED)}
+
+        scores = np.empty(len(instances), dtype=float)
+        for i, instance in enumerate(instances):
+            seq = instance[0].rep
+            total = 0.0
+            for pos_idx, aa in enumerate(seq):
+                col = aa_to_col.get(str(aa))
+                if col is None:
+                    total = np.nan
+                    break
+                val = log_pssm[pos_idx, col]
+                if np.isnan(val):
+                    total = np.nan
+                    break
+                total += float(val)
+            scores[i] = total
+        return scores
+
+    # --- Transformer API ----------------------------------------------------
+
+    def transform(
+        self,
+        instances: Sequence[SystemInstance],
+        entity: int | None = None,
+        status_callback: StatusCallback | None = None,  # noqa: ARG002
+    ) -> list[SystemInstance]:
+        """
+        Decompose each instance's score into per-residue contributions and
+        stash the resulting L-vector as ``entity_instance.embedding``.
+
+        Specifically, ``embedding[i] = log p_i(x_i)`` where ``p_i`` is SIFT's
+        column-normalized probability at position ``i`` and ``x_i`` is the
+        instance's residue at that position. By construction
+        ``embedding.sum() == score(instance)``, and the diagonal of
+        ``single_mutation_scan`` (relative log-odds) is recovered from the
+        difference between the mutant's and the WT's embeddings at the
+        substituted positions.
+
+        Returns shallow copies of each instance with ``embedding`` and
+        ``score`` filled in; the input list is left unmodified per the
+        Transformer contract.
+        """
+        self.ready_or_raise()
+        self._validate_instances(instances)
+
+        entity = 0 if entity is None else entity
+        if entity != 0:
+            raise ValueError("Model can only handle one single entity")
+
+        log_pssm = self._pssm_to_log(self.encoding)
+        aa_to_col = {aa: i for i, aa in enumerate(VALID_AA_SORTED)}
+
+        out: list[SystemInstance] = []
+        for instance in instances:
+            inst_copy = instance.copy()
+            ent_copy = inst_copy[entity]
+
+            seq = ent_copy.rep
+            per_residue = np.empty(len(seq), dtype=float)
+            for pos_idx, aa in enumerate(seq):
+                col = aa_to_col.get(str(aa))
+                per_residue[pos_idx] = (
+                    log_pssm[pos_idx, col] if col is not None else np.nan
+                )
+
+            ent_copy.embedding = per_residue
+            inst_copy.score = float(np.nansum(per_residue)) if not np.isnan(
+                per_residue
+            ).any() else float("nan")
+            out.append(inst_copy)
+        return out
+
     # --- MutationScorer API -------------------------------------------------
 
     def score_mutants(
@@ -550,6 +684,68 @@ class SIFT(BaseModel, MutationScorer, ConditionalMutationScorer):
             index, names=["instance", "entity", "pos"]
         )
         return df
+
+    # --- Generator API ------------------------------------------------------
+
+    def generate(
+        self,
+        num_designs: int,
+        entities: Sequence[int] | None = None,
+        fixed_pos: EntityPosList | None = None,
+        temperature: float = 1.0,
+        status_callback: StatusCallback | None = None,
+    ) -> list[SystemInstance]:
+        """
+        Generate designs by Gibbs sampling using SIFT's per-position log-PSSM
+        as the conditional scorer. Each returned design carries a sum-of-
+        single-mutations score against the entity rep — the only meaningful
+        "joint score" SIFT exposes (it has no proper sequence likelihood).
+        """
+        self.ready_or_raise()
+        entities = entities if entities is not None else [0]
+        entities = ensure_sequence(entities)
+        if len(entities) != 1 or entities[0] != 0:
+            raise ValueError(
+                "SIFT can only design a single entity (entities = [0] | None)"
+            )
+
+        sampler = GibbsSampler(
+            scorers=[self],
+            weights=None,
+            num_sweeps=self.num_sweeps,
+            init_strategy=self.init_strategy,
+            scan_order=self.scan_order,
+            temperature_schedule=self.temperature_schedule,
+            require_strict_pos=True,
+            record_full_chain=False,
+        )
+        instances = sampler.generate(
+            num_designs=num_designs,
+            entities=entities,
+            fixed_pos=fixed_pos,
+            temperature=temperature,
+            status_callback=status_callback,
+        )
+
+        target = self.system[0]
+        first = target.first_index
+        rep_seq = "".join(target.rep)
+        ref_instance = SystemInstance(EntityInstance(rep=rep_seq))
+        modeled_positions = [pos for (_, pos) in self.positions(ref_instance)]
+
+        for inst in instances:
+            mutants = []
+            for pos in modeled_positions:
+                row_idx = pos - first
+                ref_aa = rep_seq[row_idx]
+                to_aa = str(inst[0].rep[row_idx])
+                mutants.append(
+                    [Mutation(entity=0, pos=pos, ref=ref_aa, to=to_aa)]
+                )
+            inst.score = float(
+                np.nansum(self.score_mutants(ref_instance, mutants))
+            )
+        return list(instances)
 
     # --- housekeeping -------------------------------------------------------
 

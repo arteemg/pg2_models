@@ -7,12 +7,16 @@ protein sequences trained from an MSA with the standalone `plmc` C tool.
 Once trained, the resulting binary `.model` file fully describes the model
 through per-position fields `h_i` and pairwise couplings `J_ij`.
 
-The wrapper exposes the four scoring/sampling interfaces of evedesign:
+The wrapper exposes the five scoring/sampling/transform interfaces of evedesign:
 
 * `Scorer`                       — full statistical energy (sequence Hamiltonian)
 * `MutationScorer`               — single and higher-order mutation effects
 * `ConditionalMutationScorer`    — per-position log-conditional energies
 * `Generator`                    — Gibbs sampling driven by `GibbsSampler`
+* `Transformer`                  — per-residue Hamiltonian contributions
+                                   ``h_i(x_i) + (1/2) Σ_{j≠i} J_ij(x_i, x_j)``
+                                   stashed as ``entity_instance.embedding``;
+                                   sums to ``score(instance)`` by construction.
 
 Conventions inherited from EVcouplings:
 
@@ -50,6 +54,7 @@ from evedesign.model import (
     Generator,
     MutationScorer,
     Scorer,
+    Transformer,
 )
 from evedesign.samplers.gibbs import (
     GibbsSampler,
@@ -81,6 +86,7 @@ class EVcouplings(
     MutationScorer,
     ConditionalMutationScorer,
     Generator,
+    Transformer,
 ):
     """
     Wrapper around a pre-trained EVcouplings Potts model.
@@ -350,6 +356,70 @@ class EVcouplings(
             seqs = np.stack([self._convert_one(inst) for inst in instances], axis=0)
             h = self.model.hamiltonians(seqs)
         return h[:, FULL].astype(float)
+
+    # ------------------------------------------------------- Transformer API
+
+    def transform(
+        self,
+        instances: Sequence[SystemInstance],
+        entity: int | None = None,
+        status_callback: StatusCallback | None = None,  # noqa: ARG002
+    ) -> list[SystemInstance]:
+        """
+        Decompose each instance's Hamiltonian by residue and stash the
+        result as ``entity_instance.embedding``.
+
+        The decomposition uses the symmetric per-residue contribution
+        ``e_i = h_i(x_i) + (1/2) Σ_{j ≠ i} J_ij(x_i, x_j)`` so that
+        ``Σ_i e_i ≡ H(x) ≡ score(x)`` exactly. Positions outside the
+        model's index list (e.g. lower-case columns dropped from a focus
+        alignment) are filled with NaN in the embedding so the caller can
+        tell modeled vs. unmodeled positions apart.
+
+        Returns shallow copies of each instance with ``embedding`` and
+        ``score`` filled in; the input list is left unmodified per the
+        Transformer contract.
+        """
+        self.ready_or_raise()
+        self._validate_instances(instances)
+
+        entity = 0 if entity is None else entity
+        if entity != 0:
+            raise ValueError("Model can only handle one single entity")
+
+        target = self.system[0]
+        first_index = target.first_index
+        rep_len = len(target.rep)
+        # per-instance dimension is the *full* entity rep length so the
+        # embedding is interpretable position-by-position alongside rep.
+        with self._ensure_loaded():
+            L = self.model.L
+            j_arange = np.arange(L)
+
+            out: list[SystemInstance] = []
+            for instance in instances:
+                seq = self._convert_one(instance)  # (L,) model indices
+
+                h_at_seq = self.model.h_i[j_arange, seq]  # (L,)
+                # J_ij[i, j, x_i, x_j] for x = seq, vectorised:
+                J_at_seq = self.model.J_ij[
+                    j_arange[:, None], j_arange[None, :],
+                    seq[:, None], seq[None, :],
+                ]
+                np.fill_diagonal(J_at_seq, 0.0)
+                per_pos_model = h_at_seq + 0.5 * J_at_seq.sum(axis=1)  # (L,)
+
+                # scatter back to full rep length, leaving unmodeled
+                # positions as NaN.
+                per_residue = np.full(rep_len, np.nan)
+                for k, p in enumerate(self._idx_to_pos):
+                    per_residue[int(p) - first_index] = float(per_pos_model[k])
+
+                inst_copy = instance.copy()
+                inst_copy[entity].embedding = per_residue
+                inst_copy.score = float(np.nansum(per_residue))
+                out.append(inst_copy)
+        return out
 
     # --------------------------------------------------- MutationScorer API
 
