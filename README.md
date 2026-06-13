@@ -8,6 +8,14 @@ predictors:
 - **GEMME** — Global Epistatic Model for predicting Mutational Effects
   ([Laine, Karami, Carbone 2019](https://doi.org/10.1093/molbev/msz179))
 
+## Benchmark
+
+Spearman ρ between predicted and measured DMS scores on the
+[Gersing 2022](https://doi.org/10.1101/2022.10.10.511562) HXK4_HUMAN
+dataset (8,570 single-residue mutants), MSA depth 5,000.
+
+![HXK4_HUMAN benchmark](figures/hxk4_spearman.png)
+
 ## GEMME — quick start
 
 ```python
